@@ -2,7 +2,7 @@
 
 Based on: *"Privilege Escalation Detection and Prediction Method Based on eBPF and Machine Learning"* (IEEE 2024)
 
-This tool uses eBPF (via BCC/Python) to monitor privilege-escalation-relevant system calls in real time and produce labeled datasets for the ML detection pipeline.
+This tool uses eBPF (via BCC/Python) to monitor privilege-escalation-relevant system calls in real time and produce labeled CSV datasets (plus a small per-run JSON summary) for the ML detection pipeline.
 
 ---
 
@@ -28,7 +28,6 @@ python3 -c "from bcc import BPF; print('BCC OK')"
 | `collector.py` | Main eBPF data collector (BCC/Python) |
 | `simulate_attacks.sh` | Generates attack syscall patterns (label=1) |
 | `simulate_normal.sh` | Generates normal syscall patterns (label=0) |
-| `merge_data.py` | Merges normal + attack CSVs into one labeled dataset |
 
 ---
 
@@ -65,13 +64,21 @@ sudo bash simulate_attacks.sh
 
 After the simulation finishes, press **Ctrl+C** in Terminal 1.
 
-### Step 3: Merge into Labeled Dataset
+Each collection run writes one `syscalls_<label>_<timestamp>.csv` (plus a small
+`summary_<label>_<timestamp>.json`) into `collected_data/`. Repeat Step 1 and
+Step 2 as many times as you like — more sessions give a more diverse dataset.
+
+### Step 3: Train
+
+No merge step is needed. The training script reads every
+`collected_data/syscalls_*.csv` directly, applies the labels, filters
+collection noise, and builds the windowed dataset itself:
 
 ```bash
-python3 merge_data.py --output-dir collected_data
+# from the project root
+python3 anomaly_detector/bosc_train.py \
+    --global-window --window 200 --stride 50 --ngram 2 --tfidf --balance
 ```
-
-This produces `collected_data/merged_dataset_<timestamp>.csv` — ready for the ML pipeline.
 
 ---
 
@@ -96,22 +103,6 @@ This produces `collected_data/merged_dataset_<timestamp>.csv` — ready for the 
 | `filename` | string | File path (for file-related syscalls) |
 | `is_root` | int | 1 if UID=0, else 0 |
 | `label` | int | **0 = normal, 1 = attack** |
-
-### JSON Structure
-
-```json
-{
-  "metadata": {
-    "label": "normal",
-    "start": "2025-01-01T12:00:00",
-    "duration_s": 30.5,
-    "total_events": 1234,
-    "kernel": "7.0.0-22-generic",
-    "hostname": "myhost"
-  },
-  "events": [ ... ]
-}
-```
 
 ### Summary JSON
 
@@ -182,13 +173,12 @@ This produces `collected_data/merged_dataset_<timestamp>.csv` — ready for the 
 
 ## Feeding into ML Pipeline (Part 2)
 
-The merged CSV is designed to feed directly into:
-1. **Isolation Forest** — for anomaly scoring
-2. **LEA-XGBoost** — for classification/prediction
+The collected `syscalls_*.csv` files feed directly into the anomaly detector
+(`anomaly_detector/`), which builds Bag-of-System-Calls (BoSC) frequency
+vectors over sliding windows and trains:
+1. **Isolation Forest** — unsupervised novelty scoring (normal-only baseline)
+2. **Random Forest** — supervised normal-vs-attack classification
 
-Feature engineering suggestions from the paper:
-- Syscall frequency per PID (sliding window)
-- UID change events per time window
-- Process-parent relationship chains (PID→PPID)
-- File path sensitivity score
-- Anomaly score from Isolation Forest
+See `anomaly_detector/bosc_train.py` (training), `bosc_evaluate.py` (metrics
+and plots), and `bosc_realtime.py` (live scoring, also used by
+`collector.py --score`).
