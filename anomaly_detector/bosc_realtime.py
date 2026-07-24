@@ -156,11 +156,12 @@ class RealtimeScorer:
         rf_proba       = self.rf.predict_proba(vec_2d)[0]
         rf_attack_prob = rf_proba[1] if len(rf_proba) > 1 else 0.0
 
+
         rf_flags_attack = rf_attack_prob > self.rf_threshold
         if self.require_agreement:
-            is_anomaly = (iso_pred == -1) and rf_flags_attack
+            is_anomaly = rf_flags_attack and (iso_pred == -1)
         else:
-            is_anomaly = (iso_pred == -1) or rf_flags_attack
+            is_anomaly = rf_flags_attack
 
         reason = (
             f"RF_attack_prob={rf_attack_prob:.0%}  "
