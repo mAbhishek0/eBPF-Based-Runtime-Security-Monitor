@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .claude/
 data_collector/collected_data/
+report
+anomaly_detector/report.html
+anomaly_detector/demo.py
+

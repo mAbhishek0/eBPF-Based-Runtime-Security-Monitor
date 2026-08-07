@@ -50,12 +50,10 @@ class RealtimeScorer:
     def __init__(self, model_dir: str = "anomaly_detector/models",
                  verbose: bool = False,
                  exclude_comm: set = None,
-                 rf_threshold: float = 0.5,
-                 require_agreement: bool = False):
+                 rf_threshold: float = 0.5):
         self.verbose = verbose
         self.exclude_comm = DEFAULT_NOISE_COMM if exclude_comm is None else set(exclude_comm)
         self.rf_threshold = rf_threshold
-        self.require_agreement = require_agreement
         self._load_models(model_dir)
 
         if self.per_pid:
@@ -98,10 +96,10 @@ class RealtimeScorer:
         self.bigram_list  = [tuple(b) for b in raw_bigrams]
         self.bigram_index = {bg: i for i, bg in enumerate(self.bigram_list)}
 
-        iso_path = meta.get("isoforest_path", meta.get("ocsvm_path"))
-        self.anomaly_model = joblib.load(os.path.join(model_dir, iso_path))
-        self._is_isoforest = "IsolationForest" in type(self.anomaly_model).__name__
-
+        # The detector is the Random Forest only. An Isolation Forest was
+        # evaluated as an unsupervised baseline but did not earn a place in
+        # the operational path (see the paper), so it is neither loaded nor
+        # scored here.
         self.rf = joblib.load(os.path.join(model_dir, meta["rf_path"]))
 
         self.tfidf = None
@@ -111,10 +109,9 @@ class RealtimeScorer:
                 self.tfidf = joblib.load(tpath)
 
         mode_str = "GLOBAL stream" if not self.per_pid else "per-PID"
-        model_name = "IsolationForest" if self._is_isoforest else "OneClassSVM"
         print(f"\n{'='*60}")
-        print(f"  [RealtimeScorer] Models loaded from {model_dir!r}")
-        print(f"  Anomaly model  : {model_name}")
+        print(f"  [RealtimeScorer] Model loaded from {model_dir!r}")
+        print(f"  Detector       : Random Forest")
         print(f"  Window mode    : {mode_str}")
         print(f"  Window size    : {self.window_size} events")
         print(f"  Stride         : {self.stride} events")
@@ -148,26 +145,11 @@ class RealtimeScorer:
 
     def _score_vector(self, vec: np.ndarray) -> tuple:
         vec_2d = vec.reshape(1, -1)
-
-        iso_pred  = self.anomaly_model.predict(vec_2d)[0]
-        iso_score = -self.anomaly_model.decision_function(vec_2d)[0]
-        iso_label = "ANOMALY" if iso_pred == -1 else "normal"
-
         rf_proba       = self.rf.predict_proba(vec_2d)[0]
         rf_attack_prob = rf_proba[1] if len(rf_proba) > 1 else 0.0
-
-
-        rf_flags_attack = rf_attack_prob > self.rf_threshold
-        if self.require_agreement:
-            is_anomaly = rf_flags_attack and (iso_pred == -1)
-        else:
-            is_anomaly = rf_flags_attack
-
-        reason = (
-            f"RF_attack_prob={rf_attack_prob:.0%}  "
-            f"IsoForest={iso_label}(score={iso_score:.3f})"
-        )
-        return is_anomaly, rf_attack_prob, iso_score, reason
+        is_anomaly     = rf_attack_prob > self.rf_threshold
+        reason = f"RF_attack_prob={rf_attack_prob:.0%}"
+        return is_anomaly, rf_attack_prob, reason
 
     def _top_features(self, vec: np.ndarray, n: int = 5) -> list:
         all_names = list(self.syscall_list)
@@ -180,7 +162,7 @@ class RealtimeScorer:
         ]
 
 
-    def _fire_alert(self, vec, rf_prob, iso_score, pid=None, comm="", uid=0):
+    def _fire_alert(self, vec, rf_prob, pid=None, comm="", uid=0):
         self._total_alerts += 1
         top = ", ".join(self._top_features(vec))
         pid_str = f"PID={pid} " if pid is not None else ""
@@ -191,7 +173,6 @@ class RealtimeScorer:
             f"  ╚══════════════════════════════════════════════════╝\n"
             f"  {pid_str}{comm_str}UID={uid}\n"
             f"  RF attack probability : {rf_prob:.0%}\n"
-            f"  IsoForest anomaly score: {iso_score:.3f}\n"
             f"  Top features in window: [{top}]\n"
         )
 
@@ -217,7 +198,7 @@ class RealtimeScorer:
             return False
 
         vec = self._vectorise(buf)
-        is_anomaly, rf_prob, iso_score, reason = self._score_vector(vec)
+        is_anomaly, rf_prob, reason = self._score_vector(vec)
 
         if self.verbose:
             print(f"  [score] PID={pid} {reason}")
@@ -227,7 +208,7 @@ class RealtimeScorer:
             last = self._last_alert.get(pid, 0.0)
             if now - last >= ALERT_COOLDOWN_S:
                 self._last_alert[pid] = now
-                self._fire_alert(vec, rf_prob, iso_score, pid=pid, comm=comm, uid=uid)
+                self._fire_alert(vec, rf_prob, pid=pid, comm=comm, uid=uid)
                 return True
         return False
 
@@ -242,7 +223,7 @@ class RealtimeScorer:
             return False
 
         vec = self._vectorise(self._global_window)
-        is_anomaly, rf_prob, iso_score, reason = self._score_vector(vec)
+        is_anomaly, rf_prob, reason = self._score_vector(vec)
 
         if self.verbose:
             print(f"  [global score] event#{self._event_count}  {reason}")
@@ -251,8 +232,7 @@ class RealtimeScorer:
             now = time.monotonic()
             if now - self._last_global_alert >= GLOBAL_COOLDOWN_S:
                 self._last_global_alert = now
-                self._fire_alert(vec, rf_prob, iso_score,
-                                 pid=pid, comm=comm, uid=uid)
+                self._fire_alert(vec, rf_prob, pid=pid, comm=comm, uid=uid)
                 return True
         return False
 
@@ -289,13 +269,9 @@ if __name__ == "__main__":
                         help=f"Process names to ignore (default: {sorted(DEFAULT_NOISE_COMM)})")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="RF attack-probability threshold to flag a window (default: 0.5)")
-    parser.add_argument("--require-agreement", action="store_true",
-                        help="Only alert when RF AND IsoForest both flag the window "
-                             "(fewer false positives, may miss subtler attacks)")
     args = parser.parse_args()
 
     scorer = RealtimeScorer(model_dir=args.model_dir, verbose=args.verbose,
                             exclude_comm=args.exclude_comm,
-                            rf_threshold=args.threshold,
-                            require_agreement=args.require_agreement)
+                            rf_threshold=args.threshold)
     _replay_csv(args.csv, scorer)

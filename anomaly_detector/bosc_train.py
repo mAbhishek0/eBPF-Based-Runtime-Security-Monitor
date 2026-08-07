@@ -4,7 +4,8 @@ bosc_train.py — Bag-of-System-Calls Feature Engineering & Model Training
 
 * N-gram BoSC  : adds bigram counts for critical syscall pairs (--ngram 2).
 * TF-IDF       : downweights frequent background syscalls (--tfidf).
-* IsolationForest replaces OneClassSVM — far more robust on small datasets.
+* RandomForest is the operational detector; IsolationForest is an optional
+  rejected baseline, trained only with --with-isoforest.
 * StratifiedKFold CV for reliable metrics (--cv-folds, default 5).
 * Window parameter search via --tune-window.
 * RandomForest hyperparameter search via --tune-rf.
@@ -142,8 +143,15 @@ def load_csv_files(data_dir: str, exclude_comm: set = None) -> pd.DataFrame:
     y : ndarray (n_windows,)            — 0=normal, 1=attack
     """
 
-def make_windows(df: pd.DataFrame, window_size: int, stride: int,  per_pid: bool = True, ngram: int = 1) -> tuple:
-    
+def make_windows(df: pd.DataFrame, window_size: int, stride: int,  per_pid: bool = True, ngram: int = 1,
+                 min_attack: int = 1, min_attack_frac: float = 0.0) -> tuple:
+    # Window-labeling rule (matters for interleaved/mixed data): a window is
+    # labeled attack only if it contains at least `min_attack` attack events
+    # AND at least `min_attack_frac` of its events are attack. Defaults
+    # (min_attack=1, frac=0) reproduce the old "any attack event => attack"
+    # rule. On genuinely mixed windows a stricter rule (e.g. frac=0.1) avoids
+    # calling a mostly-benign window "attack" just because one attack syscall
+    # drifted into it.
     syscall_idx = {s: i for i, s in enumerate(KNOWN_SYSCALLS)}
     n_uni = len(KNOWN_SYSCALLS)
     n_features = n_uni + (N_BIGRAMS if ngram >= 2 else 0)
@@ -190,8 +198,10 @@ def make_windows(df: pd.DataFrame, window_size: int, stride: int,  per_pid: bool
             if len(buf) == window_size:
                 start = t - window_size + 1
                 if start % stride == 0:
+                    is_attack = (attack_count >= min_attack and
+                                 attack_count >= min_attack_frac * window_size)
                     X_rows.append(vec.copy())
-                    y_rows.append(1 if attack_count > 0 else 0)
+                    y_rows.append(1 if is_attack else 0)
 
     if per_pid:
         df_s = df.sort_values(["pid", "timestamp_ns"]).reset_index(drop=True)
@@ -262,8 +272,9 @@ Returns best_params dict and full results list.
 """
 
 def tune_window_params(df: pd.DataFrame, ngram: int = 1, cv_folds: int = 5, per_pid: bool = True, window_candidates: list = None,
-                       balance_ratio: float = 3.0) -> tuple:
-    
+                       balance_ratio: float = 3.0,
+                       min_attack: int = 1, min_attack_frac: float = 0.0) -> tuple:
+
     if window_candidates is None:
         window_candidates = [10, 20, 30, 50]
     candidates = [
@@ -277,7 +288,8 @@ def tune_window_params(df: pd.DataFrame, ngram: int = 1, cv_folds: int = 5, per_
 
     best_score, best_params, results = -1.0, {}, []
     for W, stride in candidates:
-        X, y = make_windows(df, W, stride, per_pid=per_pid, ngram=ngram)
+        X, y = make_windows(df, W, stride, per_pid=per_pid, ngram=ngram,
+                            min_attack=min_attack, min_attack_frac=min_attack_frac)
         if len(X) < 20 or y.sum() == 0 or (y == 0).sum() == 0:
             continue
         X, y = _undersample_normal(X, y, ratio=balance_ratio)
@@ -366,8 +378,19 @@ def save_models(model_dir: str, isoforest, rf, window_size: int, stride: int,
                 window_tune_results: list = None):
     os.makedirs(model_dir, exist_ok=True)
 
-    joblib.dump(isoforest, os.path.join(model_dir, "isoforest.joblib"))
-    joblib.dump(rf,        os.path.join(model_dir, "random_forest.joblib"))
+    # The Random Forest is the operational detector. The Isolation Forest is
+    # only saved when explicitly requested (--with-isoforest); it is a rejected
+    # baseline, not part of the shipped model. Any stale isoforest.joblib from
+    # a previous run is removed so the model directory stays consistent.
+    joblib.dump(rf, os.path.join(model_dir, "random_forest.joblib"))
+    iso_path = None
+    if isoforest is not None:
+        joblib.dump(isoforest, os.path.join(model_dir, "isoforest.joblib"))
+        iso_path = "isoforest.joblib"
+    else:
+        stale = os.path.join(model_dir, "isoforest.joblib")
+        if os.path.exists(stale):
+            os.remove(stale)
     if use_tfidf and tfidf_transformer is not None:
         joblib.dump(tfidf_transformer,
                     os.path.join(model_dir, "tfidf.joblib"))
@@ -384,10 +407,9 @@ def save_models(model_dir: str, isoforest, rf, window_size: int, stride: int,
         "use_tfidf":          use_tfidf,
         "n_features":         len(KNOWN_SYSCALLS) + (N_BIGRAMS if ngram >= 2 else 0),
         "bigrams":            bigrams_json,
-        "isoforest_path":     "isoforest.joblib",
+        "isoforest_path":     iso_path,
         "rf_path":            "random_forest.joblib",
         "tfidf_path":         "tfidf.joblib" if use_tfidf else None,
-        "ocsvm_path":         "isoforest.joblib",
         "cv_f1_mean":         round(cv_f1, 4) if cv_f1 is not None else None,
         "best_rf_params":     best_rf_params,
         "window_tune_results": window_tune_results,
@@ -395,8 +417,9 @@ def save_models(model_dir: str, isoforest, rf, window_size: int, stride: int,
     with open(os.path.join(model_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2, default=str)
 
-    print(f"\n  Saved → {model_dir}/isoforest.joblib")
-    print(f"  Saved → {model_dir}/random_forest.joblib")
+    print(f"\n  Saved → {model_dir}/random_forest.joblib")
+    if iso_path:
+        print(f"  Saved → {model_dir}/isoforest.joblib")
     if use_tfidf:
         print(f"  Saved → {model_dir}/tfidf.joblib")
     print(f"  Saved → {model_dir}/meta.json")
@@ -421,6 +444,10 @@ def main():
                         help="1=unigram only (default), 2=unigram+bigram")
     parser.add_argument("--tfidf",     action="store_true",
                         help="Apply TF-IDF weighting to count vectors")
+    parser.add_argument("--with-isoforest", action="store_true",
+                        help="Also train and save an Isolation Forest. It is a "
+                             "rejected baseline (see paper), not part of the "
+                             "operational detector, so it is off by default.")
     parser.add_argument("--tune-window", action="store_true",
                         help="Grid-search best (window, stride) before training")
     parser.add_argument("--window-candidates", type=int, nargs="+",
@@ -445,6 +472,15 @@ def main():
                              "editors, browsers, ...) get mislabeled as normal/attack. "
                              f"Default: {sorted(DEFAULT_COMM_DENYLIST)}. Pass "
                              "--exclude-comm with no values to disable filtering.")
+    parser.add_argument("--min-attack-events", type=int, default=1,
+                        help="A window is labeled attack only if it holds at "
+                             "least this many attack events (default: 1). Raise "
+                             "for interleaved data to avoid labeling a mostly "
+                             "benign window attack over a single stray event.")
+    parser.add_argument("--min-attack-frac", type=float, default=0.0,
+                        help="A window is labeled attack only if at least this "
+                             "fraction of its events are attack (default: 0.0). "
+                             "e.g. 0.1 on interleaved data.")
     args = parser.parse_args()
 
     print("=" * 65)
@@ -474,6 +510,8 @@ def main():
         best_wp, window_tune_results = tune_window_params(
             df, ngram=args.ngram, cv_folds=args.cv_folds, per_pid=per_pid,
             window_candidates=args.window_candidates,
+            min_attack=args.min_attack_events,
+            min_attack_frac=args.min_attack_frac,
         )
         window_size = best_wp["window_size"]
         stride      = best_wp["stride"]
@@ -486,7 +524,9 @@ def main():
     print(f"\n[3/6] Building BoSC windows "
           f"(W={window_size}, stride={stride}, ngram={args.ngram}) ...")
     X, y = make_windows(df, window_size, stride,
-                        per_pid=per_pid, ngram=args.ngram)
+                        per_pid=per_pid, ngram=args.ngram,
+                        min_attack=args.min_attack_events,
+                        min_attack_frac=args.min_attack_frac)
     n_uni = len(KNOWN_SYSCALLS)
     n_bi  = N_BIGRAMS if args.ngram >= 2 else 0
     print(f"  Feature dimensions : {n_uni} unigrams"
@@ -544,7 +584,9 @@ def main():
 
     # 6. Train models
     print("\n[5/6] Training models ...")
-    isoforest = train_isolation_forest(X_normal_train)
+    # The Random Forest is the operational detector. The Isolation Forest is a
+    # rejected baseline, trained only when --with-isoforest is passed.
+    isoforest = train_isolation_forest(X_normal_train) if args.with_isoforest else None
     rf, best_rf_params, cv_f1 = train_random_forest(
         X_train, y_train,
         tune=args.tune_rf,

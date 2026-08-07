@@ -1,0 +1,33 @@
+{
+  "label": "mixed",
+  "duration_s": 331.43,
+  "total_events": 428502,
+  "events_per_sec": 1292.87,
+  "syscall_distribution": {
+    "openat": 218685,
+    "mmap": 165656,
+    "clone": 9144,
+    "execve": 12052,
+    "prctl": 8164,
+    "setresuid": 2030,
+    "setresgid": 1647,
+    "chown": 70,
+    "setgid": 2186,
+    "capset": 171,
+    "open": 225,
+    "chmod": 34,
+    "setuid": 2605,
+    "setreuid": 1264,
+    "setregid": 1264,
+    "unshare": 139,
+    "fchown": 1012,
+    "mount": 2149,
+    "execveat": 2,
+    "fchmod": 3
+  },
+  "unique_pids": 10721,
+  "unique_uids": 6,
+  "files": {
+    "csv": "interleaved_tracee/syscalls_mixed_20260803_101009.csv"
+  }
+}

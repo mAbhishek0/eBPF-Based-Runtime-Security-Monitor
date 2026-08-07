@@ -49,12 +49,12 @@ def load_artefacts(model_dir: str):
     with open(meta_path) as f:
         meta = json.load(f)
 
-    # Support both old (ocsvm) and new (isoforest) model files
-    isoforest_path = os.path.join(
-        model_dir,
-        meta.get("isoforest_path", meta.get("ocsvm_path", "isoforest.joblib"))
-    )
-    isoforest = joblib.load(isoforest_path)
+    # The Isolation Forest is a rejected baseline and is absent from the
+    # shipped RF-only model (train with --with-isoforest to include it).
+    isoforest = None
+    iso_rel = meta.get("isoforest_path") or meta.get("ocsvm_path")
+    if iso_rel and os.path.exists(os.path.join(model_dir, iso_rel)):
+        isoforest = joblib.load(os.path.join(model_dir, iso_rel))
     rf = joblib.load(os.path.join(model_dir, meta["rf_path"]))
 
     # Optional TF-IDF transformer
@@ -287,30 +287,32 @@ def main():
 
     # 2. Score
     print("\n[2/7] Scoring test windows ...")
-    iso_pred, iso_scores = evaluate_isoforest(isoforest, X_test, y_test)
     rf_pred,  rf_scores  = evaluate_rf(rf, X_test)
+    has_iso = isoforest is not None
+    if has_iso:
+        iso_pred, iso_scores = evaluate_isoforest(isoforest, X_test, y_test)
+    else:
+        print("  (Isolation Forest not present in model; RF-only evaluation.)")
 
     # 3. Console metrics
     print("\n[3/7] Computing metrics ...")
-    model_label = ("IsolationForest" if hasattr(isoforest, "decision_function")
-                   and "IsolationForest" in type(isoforest).__name__
-                   else "OneClassSVM")
-    print_report(f"{model_label} (novelty detector)", y_test, iso_pred, iso_scores)
+    if has_iso:
+        print_report("IsolationForest (novelty detector)", y_test, iso_pred, iso_scores)
     print_report("Random Forest (supervised)",          y_test, rf_pred,  rf_scores)
 
     # 4. Confusion matrices
     print("\n[4/7] Plotting confusion matrices ...")
-    plot_confusion(y_test, iso_pred, f"{model_label} Confusion Matrix",
-                   os.path.join(args.plot_dir, "cm_isoforest.png"))
+    if has_iso:
+        plot_confusion(y_test, iso_pred, "IsolationForest Confusion Matrix",
+                       os.path.join(args.plot_dir, "cm_isoforest.png"))
     plot_confusion(y_test, rf_pred, "RandomForest Confusion Matrix",
                    os.path.join(args.plot_dir, "cm_rf.png"))
 
     # 5. ROC + PR curves
     print("\n[5/7] Plotting ROC and Precision-Recall curves ...")
-    curves_data = [
-        (model_label,    y_test, iso_scores),
-        ("RandomForest", y_test, rf_scores),
-    ]
+    curves_data = [("RandomForest", y_test, rf_scores)]
+    if has_iso:
+        curves_data.insert(0, ("IsolationForest", y_test, iso_scores))
     plot_roc(curves_data, os.path.join(args.plot_dir, "roc_curves.png"))
     plot_precision_recall(curves_data,
                           os.path.join(args.plot_dir, "pr_curves.png"))

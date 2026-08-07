@@ -30,8 +30,7 @@ import argparse
 from datetime import datetime
 from collections import defaultdict
 
-# ── Optional real-time BoSC scorer (loaded only with --score) ───────
-_scorer = None   # will be a RealtimeScorer instance if --score is set
+_scorer = None   # a RealtimeScorer instance when --score is set
 
 # x86_64 Syscall Numbers(nr)
 SYSCALL_MAP = {
@@ -43,8 +42,6 @@ SYSCALL_MAP = {
     93: "fchown",     165: "mount",     322: "execveat",
     157: "prctl",     125: "capset",    272: "unshare",
 }
-
-# BPF C Program 
 
 BPF_SRC = r"""
 
@@ -67,6 +64,7 @@ struct entry_t {
 /* Event sent to userspace */
 struct event_t {
     u64 ts;
+    u64 cgroup_id;   /* cgroup v2 id — used to label attack vs normal offline */
     u32 pid;
     u32 ppid;
     u32 uid;
@@ -85,9 +83,6 @@ BPF_HASH(entries, u64, struct entry_t);
 BPF_PERCPU_ARRAY(scratch, struct event_t, 1);
 BPF_PERF_OUTPUT(events);
 
-// all the system calls which are being monitored
-// this function will return 1 if it is being monitored else 0
-
 static __always_inline int is_monitored(int nr) {
     switch (nr) {
         case 59: case 56: case 2: case 257:
@@ -101,8 +96,6 @@ static __always_inline int is_monitored(int nr) {
             return 0;
     }
 }
-
-// at the time of system call enter
 
 TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
     int nr = args->id;
@@ -148,8 +141,6 @@ TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
     return 0;
 }
 
-// at the time of system call exit
-
 TRACEPOINT_PROBE(raw_syscalls, sys_exit){
 
     u64 pid_tid = bpf_get_current_pid_tgid();
@@ -164,8 +155,8 @@ TRACEPOINT_PROBE(raw_syscalls, sys_exit){
         return 0;
     }
 
-    // filling event from entry & current context
     evt->ts  = e->ts;
+    evt->cgroup_id = bpf_get_current_cgroup_id();
     evt->nr  = e->nr;
     evt->a1  = e->a1;
     evt->a2  = e->a2;
@@ -182,8 +173,7 @@ TRACEPOINT_PROBE(raw_syscalls, sys_exit){
     bpf_get_current_comm(&evt->comm, sizeof(evt->comm));
     __builtin_memcpy(evt->fname, e->fname, sizeof(evt->fname));
 
-    // reading PPID from task_struct 
-
+    // reading PPID from task_struct
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     struct task_struct *parent;
 
@@ -196,29 +186,28 @@ TRACEPOINT_PROBE(raw_syscalls, sys_exit){
 }
 """
 
-# python ctypes struct 
+# python ctypes struct (field order/types MUST match struct event_t above)
 class Event(ct.Structure):
     _fields_ = [
-        ("ts",    ct.c_uint64),
-        ("pid",   ct.c_uint32),
-        ("ppid",  ct.c_uint32),
-        ("uid",   ct.c_uint32),
-        ("gid",   ct.c_uint32),
-        ("tid",   ct.c_uint32),
-        ("nr",    ct.c_int32),
-        ("ret",   ct.c_long),
-        ("a1",    ct.c_long),
-        ("a2",    ct.c_long),
-        ("a3",    ct.c_long),
-        ("comm",  ct.c_char * 16),
-        ("fname", ct.c_char * 256),
+        ("ts",        ct.c_uint64),
+        ("cgroup_id", ct.c_uint64),
+        ("pid",       ct.c_uint32),
+        ("ppid",      ct.c_uint32),
+        ("uid",       ct.c_uint32),
+        ("gid",       ct.c_uint32),
+        ("tid",       ct.c_uint32),
+        ("nr",        ct.c_int32),
+        ("ret",       ct.c_long),
+        ("a1",        ct.c_long),
+        ("a2",        ct.c_long),
+        ("a3",        ct.c_long),
+        ("comm",      ct.c_char * 16),
+        ("fname",     ct.c_char * 256),
     ]
 
-
-# CSV file column
 CSV_HEADERS = [
     "timestamp_ns", "timestamp_human", "pid", "ppid", "tid", "uid", "gid", "comm", "syscall_nr", "syscall_name",
-    "arg1", "arg2", "arg3", "return_value", "filename", "is_root", "label",
+    "arg1", "arg2", "arg3", "return_value", "filename", "is_root", "cgroup_id", "label",
 ]
 
 
@@ -227,7 +216,10 @@ class DataCollector:
 
     def __init__(self, label: str, output_dir: str, quiet: bool = False,
                  save: bool = True):
-        self.label = 0 if label == "normal" else 1
+        # "mixed" is a placeholder session label for interleaved collection;
+        # the real per-event labels are assigned later by label_interleaved.py
+        # from the cgroup id, so the value here does not matter for "mixed".
+        self.label = 1 if label == "attack" else 0
         self.label_str = label
         self.output_dir = output_dir
         self.quiet = quiet
@@ -253,13 +245,11 @@ class DataCollector:
         self.csv_file = None
         self.csv_writer = None
 
-    # setting up the CSV file 
     def _open_csv(self):
         self.csv_file = open(self.csv_path, "w", newline="", buffering=1)
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(CSV_HEADERS)
 
-    # event callback
     def _on_event(self, cpu, data, size):
         global _scorer
         e = ct.cast(data, ct.POINTER(Event)).contents
@@ -272,7 +262,7 @@ class DataCollector:
         if self.save:
             row = [
                 e.ts, ts_human, e.pid, e.ppid, e.tid, e.uid, e.gid, comm, e.nr, name,
-                e.a1, e.a2, e.a3, e.ret, fname, is_root, self.label,]
+                e.a1, e.a2, e.a3, e.ret, fname, is_root, e.cgroup_id, self.label,]
             self.csv_writer.writerow(row)
         self.unique_pids.add(int(e.pid))
         self.unique_uids.add(int(e.uid))
@@ -298,12 +288,10 @@ class DataCollector:
                       f"UID={e.uid} ret={e.ret} "
                       f"{fname[:60]}{flag}  [{comm}]")
 
-    # signal handler
     def _stop(self, *_):
         print("\n[*] Stopping collection...")
         self.running = False
 
-    # main loop 
     def run(self):
         if os.geteuid() != 0:
             print("[ERROR] must run this as root: sudo python3 collector.py ...")
@@ -319,7 +307,10 @@ class DataCollector:
 
         print("Loading eBPF program...")
         try:
-            b = BPF(text=src)
+            # cflags=["-w"] silences the harmless clang macro-redefinition
+            # warnings (e.g. __HAVE_BUILTIN_BSWAP*) that the kernel headers
+            # emit during BPF compilation, keeping startup output clean.
+            b = BPF(text=src, cflags=["-w"])
         except Exception as ex:
             print(f"ERROR. BPF load failed: {ex}")
             sys.exit(1)
@@ -349,7 +340,6 @@ class DataCollector:
         elapsed = time.time() - self.start
         self._finalise(elapsed)
 
-    # writing summary
     def _finalise(self, elapsed):
         if self.csv_file:
             self.csv_file.close()
@@ -394,14 +384,15 @@ class DataCollector:
         print("=" * 65)
 
 
-# Entry point 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="eBPF syscall collector"
     )
     parser.add_argument(
-        "--label", choices=["normal", "attack"], default="normal",
-        help="Label for collected data: 'normal' (0) or 'attack' (1)"
+        "--label", choices=["normal", "attack", "mixed"], default="normal",
+        help="Session label: 'normal' (0), 'attack' (1), or 'mixed' for "
+             "interleaved collection (real labels assigned later by "
+             "label_interleaved.py from the cgroup id)."
     )
     parser.add_argument(
         "--output-dir", default="collected_data",
@@ -434,12 +425,6 @@ if __name__ == "__main__":
              "Raise this (e.g. 0.85) if you're seeing false alerts."
     )
     parser.add_argument(
-        "--require-agreement", action="store_true",
-        help="Only alert when RF AND IsoForest both flag the window — "
-             "fewer false positives on unfamiliar-but-benign systems, at "
-             "the cost of possibly missing subtler attacks."
-    )
-    parser.add_argument(
         "--no-save", action="store_true",
         help="Don't write any CSV/summary to disk — live scoring only. "
              "Use this for demos (with --score), where the collected data "
@@ -447,7 +432,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # loading BoSC scorer if requested 
     if args.score:
         try:
             import sys as _sys
@@ -458,7 +442,6 @@ if __name__ == "__main__":
                 model_dir=args.model_dir,
                 exclude_comm=set(args.exclude_comm) if args.exclude_comm is not None else None,
                 rf_threshold=args.threshold,
-                require_agreement=args.require_agreement,
             )
             print(f"[BoSC] Real-time scoring ENABLED  "
                   f"(model dir: {args.model_dir})")

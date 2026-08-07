@@ -40,9 +40,12 @@ def _gather_metrics(model_dir: str):
     with open(meta_path) as f:
         meta = json.load(f)
 
-    # Support both old (ocsvm) and new (isoforest) model files
-    iso_path = meta.get("isoforest_path", meta.get("ocsvm_path", "isoforest.joblib"))
-    iso_model = joblib.load(os.path.join(model_dir, iso_path))
+    # The Isolation Forest is a rejected baseline, absent from the shipped
+    # RF-only model (train with --with-isoforest to include it).
+    iso_rel = meta.get("isoforest_path") or meta.get("ocsvm_path")
+    iso_model = None
+    if iso_rel and os.path.exists(os.path.join(model_dir, iso_rel)):
+        iso_model = joblib.load(os.path.join(model_dir, iso_rel))
     rf        = joblib.load(os.path.join(model_dir, meta["rf_path"]))
 
     # Optional TF-IDF
@@ -56,11 +59,6 @@ def _gather_metrics(model_dir: str):
     y_test  = np.load(os.path.join(model_dir, "y_test.npy"))
     X_train = np.load(os.path.join(model_dir, "X_train.npy"))
     y_train = np.load(os.path.join(model_dir, "y_train.npy"))
-
-    # IsolationForest: -1=anomaly, +1=normal
-    iso_raw    = iso_model.predict(X_test)
-    iso_scores = -iso_model.decision_function(X_test)
-    iso_pred   = np.where(iso_raw == -1, 1, 0)
 
     # RF
     rf_pred  = rf.predict(X_test)
@@ -76,12 +74,16 @@ def _gather_metrics(model_dir: str):
         auc = roc_auc_score(y_true, scores)
         return rep, auc
 
-    iso_rep, iso_auc = _report_dict(y_test, iso_pred, iso_scores)
     rf_rep,  rf_auc  = _report_dict(y_test, rf_pred,  rf_scores)
 
-    # Detect model type for display
-    is_isoforest = "IsolationForest" in type(iso_model).__name__
-    iso_label = "IsolationForest" if is_isoforest else "OneClassSVM"
+    if iso_model is not None:
+        iso_raw    = iso_model.predict(X_test)
+        iso_scores = -iso_model.decision_function(X_test)
+        iso_pred   = np.where(iso_raw == -1, 1, 0)
+        iso_rep, iso_auc = _report_dict(y_test, iso_pred, iso_scores)
+        iso_label = "IsolationForest"
+    else:
+        iso_rep, iso_auc, iso_label = {}, float("nan"), "IsolationForest (not evaluated)"
 
     return {
         "meta":           meta,
