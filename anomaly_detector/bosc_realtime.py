@@ -13,7 +13,9 @@ Automatically detects the correct mode from meta.json.
 import argparse
 import json
 import os
+import queue
 import sys
+import threading
 import time
 from collections import defaultdict, deque
 
@@ -239,6 +241,58 @@ class RealtimeScorer:
     @property
     def alert_count(self) -> int:
         return self._total_alerts
+
+
+class AsyncScorer:
+    """
+    Decouples scoring from the event-drain thread.
+
+    The synchronous RealtimeScorer runs a Random Forest inference inline, so
+    when it is called from the collector's perf-buffer callback each ~4 ms
+    inference stalls the drain loop and the kernel ring buffer overflows. This
+    wrapper instead hands each event to a bounded queue and scores it on a
+    background worker thread, so the callback returns immediately and the drain
+    loop never blocks. Under sustained overload the queue fills and events are
+    dropped here, at the application level, with bounded latency and memory —
+    a graceful degradation, rather than kernel-level perf-buffer loss.
+
+    Exposes the same ``on_event`` signature and ``alert_count`` as
+    RealtimeScorer, so the collector uses it interchangeably.
+    """
+
+    _STOP = object()
+
+    def __init__(self, scorer: RealtimeScorer, maxsize: int = 50000):
+        self.scorer = scorer
+        self._q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self.backlog_dropped = 0
+        self._thread = threading.Thread(target=self._run, name="bosc-scorer",
+                                        daemon=True)
+        self._thread.start()
+
+    def on_event(self, pid, comm, syscall_name, uid=0):
+        try:
+            self._q.put_nowait((pid, comm, syscall_name, uid))
+        except queue.Full:
+            # worker can't keep up; drop rather than block the drain thread
+            self.backlog_dropped += 1
+
+    def _run(self):
+        while True:
+            item = self._q.get()
+            if item is self._STOP:
+                break
+            pid, comm, name, uid = item
+            self.scorer.on_event(pid=pid, comm=comm, syscall_name=name, uid=uid)
+
+    def close(self):
+        """Flush the queue, stop the worker, and wait for it to finish."""
+        self._q.put(self._STOP)          # processed after all queued events
+        self._thread.join(timeout=10)
+
+    @property
+    def alert_count(self) -> int:
+        return self.scorer.alert_count
 
 
 def _replay_csv(csv_path: str, scorer: RealtimeScorer):
