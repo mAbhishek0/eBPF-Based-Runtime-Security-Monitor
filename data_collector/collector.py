@@ -26,6 +26,7 @@ import signal
 import json
 import csv
 import time
+import resource
 import argparse
 from datetime import datetime
 from collections import defaultdict
@@ -239,6 +240,7 @@ class DataCollector:
         self.unique_pids = set()
         self.unique_uids = set()
         self.count = 0
+        self.dropped = 0        # perf-buffer samples lost under load (overhead metric)
         self.start = None
         self.running = True
         self.stats = defaultdict(int)
@@ -288,6 +290,12 @@ class DataCollector:
                       f"UID={e.uid} ret={e.ret} "
                       f"{fname[:60]}{flag}  [{comm}]")
 
+    def _on_lost(self, lost):
+        # perf_buffer_poll invokes this when the ring buffer overflows before
+        # userspace drains it. The count is the overhead/scalability metric:
+        # drops mean the collector can't keep up with the syscall rate.
+        self.dropped += lost
+
     def _stop(self, *_):
         print("\n[*] Stopping collection...")
         self.running = False
@@ -324,12 +332,14 @@ class DataCollector:
 
         if self.save:
             self._open_csv()
-        b["events"].open_perf_buffer(self._on_event, page_cnt=128)
+        b["events"].open_perf_buffer(self._on_event, page_cnt=128,
+                                     lost_cb=self._on_lost)
 
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
 
         self.start = time.time()
+        ru0 = resource.getrusage(resource.RUSAGE_SELF)
 
         while self.running:
             try:
@@ -338,22 +348,46 @@ class DataCollector:
                 break
 
         elapsed = time.time() - self.start
-        self._finalise(elapsed)
+        ru1 = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)
+        # flush the async scorer's queue so the final alert count is complete
+        if _scorer is not None and hasattr(_scorer, "close"):
+            _scorer.close()
+        self._finalise(elapsed, cpu_s)
 
-    def _finalise(self, elapsed):
+    def _finalise(self, elapsed, cpu_s=0.0):
         if self.csv_file:
             self.csv_file.close()
+
+        eps = self.count / max(elapsed, 0.001)
+        # One core fully busy = 100%. cpu_s is the collector process's own
+        # user+sys CPU seconds, i.e. the userspace overhead of draining and
+        # writing events (the in-kernel probe cost is separate and charged to
+        # the traced tasks).
+        cpu_pct = cpu_s / max(elapsed, 0.001) * 100
+        total_seen = self.count + self.dropped
+        drop_rate = self.dropped / max(total_seen, 1) * 100
 
         summary = {
             "label": self.label_str,
             "duration_s": round(elapsed, 2),
             "total_events": self.count,
-            "events_per_sec": round(self.count / max(elapsed, 0.001), 2),
+            "events_per_sec": round(eps, 2),
+            "dropped_events": self.dropped,
+            "drop_rate_pct": round(drop_rate, 3),
+            "cpu_seconds": round(cpu_s, 2),
+            "cpu_utilisation_pct": round(cpu_pct, 2),
             "syscall_distribution": dict(self.stats),
             "unique_pids": len(self.unique_pids),
             "unique_uids": len(self.unique_uids),
             "files": {"csv": self.csv_path if self.save else None},
         }
+        # scoring backlog is the app-level drop when the async worker can't
+        # keep up; distinct from perf-buffer drops (which the async path avoids)
+        backlog = getattr(_scorer, "backlog_dropped", 0) if _scorer is not None else 0
+        if _scorer is not None:
+            summary["bosc_alerts"] = _scorer.alert_count
+            summary["scoring_backlog_dropped"] = backlog
         if self.save:
             with open(self.summary_path, "w") as f:
                 json.dump(summary, f, indent=2)
@@ -367,6 +401,8 @@ class DataCollector:
         print(f"  Events/sec:     {summary['events_per_sec']}")
         print(f"  Unique PIDs:    {summary['unique_pids']}")
         print(f"  Unique UIDs:    {summary['unique_uids']}")
+        print(f"  CPU (collector):{cpu_pct:6.2f}%  ({cpu_s:.2f} CPU-s over {elapsed:.1f}s)")
+        print(f"  Dropped events: {self.dropped:,}  ({drop_rate:.3f}% drop rate)")
         print()
         print("  Syscall breakdown:")
         for name, cnt in sorted(self.stats.items(), key=lambda x: -x[1]):
@@ -375,6 +411,9 @@ class DataCollector:
             print(f"    {name:<14} {cnt:>7}  ({pct:5.1f}%) {bar}")
         if _scorer is not None:
             print(f"\n  BoSC Anomaly Alerts fired: {_scorer.alert_count}")
+            if backlog:
+                print(f"  Scoring backlog dropped:   {backlog:,} events "
+                      f"(worker overloaded; perf-buffer drop stays low)")
         print()
         if self.save:
             print(f"  CSV  → {self.csv_path}")
@@ -430,6 +469,12 @@ if __name__ == "__main__":
              "Use this for demos (with --score), where the collected data "
              "is just junk you'd delete afterwards."
     )
+    parser.add_argument(
+        "--sync-score", action="store_true",
+        help="Run BoSC scoring inline on the drain thread instead of a "
+             "background worker (--score only). Slower under load; kept for "
+             "measuring the async speedup."
+    )
     args = parser.parse_args()
 
     if args.score:
@@ -437,14 +482,19 @@ if __name__ == "__main__":
             import sys as _sys
             import os as _os
             _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
-            from anomaly_detector.bosc_realtime import RealtimeScorer
-            _scorer = RealtimeScorer(
+            from anomaly_detector.bosc_realtime import RealtimeScorer, AsyncScorer
+            _sync = RealtimeScorer(
                 model_dir=args.model_dir,
                 exclude_comm=set(args.exclude_comm) if args.exclude_comm is not None else None,
                 rf_threshold=args.threshold,
             )
+            # By default, run inference on a background worker thread so it
+            # never blocks the perf-buffer drain loop (--sync-score forces the
+            # old inline path, for measuring the difference).
+            _scorer = _sync if args.sync_score else AsyncScorer(_sync)
+            mode = "synchronous (inline)" if args.sync_score else "async (worker thread)"
             print(f"[BoSC] Real-time scoring ENABLED  "
-                  f"(model dir: {args.model_dir})")
+                  f"(model dir: {args.model_dir}, mode: {mode})")
         except Exception as exc:
             print(f"\n[ERROR] Failed to load BoSC scorer from {args.model_dir}: {exc}")
             print("[ERROR] Cannot run --score. Please check the model directory or run bosc_train.py first.\n")

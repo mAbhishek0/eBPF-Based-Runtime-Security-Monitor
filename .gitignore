@@ -3,6 +3,12 @@ __pycache__/
 *.pyc
 .claude/
 data_collector/collected_data/
+collected_data/
+data_collector/interleaved/
+data_collector/interleaved_falco/
+data_collector/interleaved_falco2/
+data_collector/interleaved_tracee/
+data_collector/interleaved_train/
 report
 anomaly_detector/report.html
 anomaly_detector/demo.py
